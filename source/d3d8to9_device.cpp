@@ -232,7 +232,21 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, cons
 {
 	UNREFERENCED_PARAMETER(pDirtyRegion);
 
-	return ProxyInterface->Present(pSourceRect, pDestRect, hDestWindowOverride, nullptr);
+	HRESULT hr = ProxyInterface->Present(pSourceRect, pDestRect, hDestWindowOverride, nullptr);
+
+	// BF1942 compatibility:
+	// Some loading-screen paths appear to pass rectangles that D3D8 tolerated but D3D9 may reject.
+	// Keep the original behavior first, then retry with a full-frame Present if that fails.
+	if (FAILED(hr))
+	{
+#ifndef D3D8TO9NOLOG
+		LOG << "BF1942 compat: 'IDirect3DDevice8::Present' failed with source/dest rects, retrying full-frame Present. Error code "
+			<< std::hex << hr << std::dec << "!" << std::endl;
+#endif
+		hr = ProxyInterface->Present(nullptr, nullptr, hDestWindowOverride, nullptr);
+	}
+
+	return hr;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetBackBuffer(UINT iBackBuffer, D3DBACKBUFFER_TYPE Type, IDirect3DSurface8 **ppBackBuffer)
 {
@@ -430,14 +444,28 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CreateImageSurface(UINT Width, UINT H
 
 	IDirect3DSurface9 *SurfaceInterface = nullptr;
 
-	const HRESULT hr = ProxyInterface->CreateOffscreenPlainSurface(Width, Height, Format, D3DPOOL_SYSTEMMEM, &SurfaceInterface, nullptr);
+	HRESULT hr = ProxyInterface->CreateOffscreenPlainSurface(Width, Height, Format, D3DPOOL_SYSTEMMEM, &SurfaceInterface, nullptr);
 
-	if (FAILED(hr) && FAILED(ProxyInterface->CreateOffscreenPlainSurface(Width, Height, Format, D3DPOOL_SCRATCH, &SurfaceInterface, nullptr)))
+	// BF1942 compatibility:
+	// If SYSTEMMEM fails, keep the existing SCRATCH fallback, but log it clearly. A SCRATCH source later
+	// requires CopyRects to use the D3DX fallback path instead of UpdateSurface.
+	if (FAILED(hr))
 	{
+		const HRESULT scratchHr = ProxyInterface->CreateOffscreenPlainSurface(Width, Height, Format, D3DPOOL_SCRATCH, &SurfaceInterface, nullptr);
+
+		if (FAILED(scratchHr))
+		{
 #ifndef D3D8TO9NOLOG
-		LOG << "> 'IDirect3DDevice9::CreateOffscreenPlainSurface' failed with error code " << std::hex << hr << std::dec << "!" << std::endl;
+			LOG << "> 'IDirect3DDevice9::CreateOffscreenPlainSurface' failed for SYSTEMMEM with error code "
+				<< std::hex << hr << " and SCRATCH with error code " << scratchHr << std::dec << "!" << std::endl;
 #endif
-		return hr;
+			return hr;
+		}
+
+#ifndef D3D8TO9NOLOG
+		LOG << "BF1942 compat: 'CreateImageSurface' fell back to D3DPOOL_SCRATCH for "
+			<< Width << "x" << Height << ", format " << Format << "." << std::endl;
+#endif
 	}
 
 	*ppSurface = ProxyAddressLookupTable->FindAddress<Direct3DSurface8>(SurfaceInterface);
@@ -456,16 +484,24 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CopyRects(IDirect3DSurface8 *pSourceS
 	pSourceSurfaceImpl->GetProxyInterface()->GetDesc(&SourceDesc);
 	pDestinationSurfaceImpl->GetProxyInterface()->GetDesc(&DestinationDesc);
 
-	if (SourceDesc.Format != DestinationDesc.Format)
-		return D3DERR_INVALIDCALL;
-
-	if (GetDepthStencilBitCount(SourceDesc.Format) != 0)
+	// Depth/stencil surfaces are not valid CopyRects sources/destinations.
+	if (GetDepthStencilBitCount(SourceDesc.Format) != 0 || GetDepthStencilBitCount(DestinationDesc.Format) != 0)
 		return D3DERR_INVALIDCALL;
 
 	HRESULT hr = D3DERR_INVALIDCALL;
 
 	if (cRects == 0)
-		cRects  = 1;
+		cRects = 1;
+
+#ifndef D3D8TO9NOLOG
+	LOG << "BF1942 compat: CopyRects request from '["
+		<< SourceDesc.Width << "x" << SourceDesc.Height << ", fmt=" << SourceDesc.Format
+		<< ", msaa=" << SourceDesc.MultiSampleType << ", usage=" << SourceDesc.Usage
+		<< ", pool=" << SourceDesc.Pool << "]' to '["
+		<< DestinationDesc.Width << "x" << DestinationDesc.Height << ", fmt=" << DestinationDesc.Format
+		<< ", msaa=" << DestinationDesc.MultiSampleType << ", usage=" << DestinationDesc.Usage
+		<< ", pool=" << DestinationDesc.Pool << "]', rects=" << cRects << "." << std::endl;
+#endif
 
 	for (UINT i = 0; i < cRects; i++)
 	{
@@ -495,93 +531,220 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CopyRects(IDirect3DSurface8 *pSourceS
 			DestinationRect = SourceRect;
 		}
 
-		if (SourceDesc.Pool == D3DPOOL_MANAGED || DestinationDesc.Pool != D3DPOOL_DEFAULT)
+		const UINT copyWidth = SourceRect.right - SourceRect.left;
+		const UINT copyHeight = SourceRect.bottom - SourceRect.top;
+		const bool SameFormat = SourceDesc.Format == DestinationDesc.Format;
+
+		auto MarkDestinationTextureDirty = [&]()
 		{
-			hr = D3DERR_INVALIDCALL;
-			if (D3DXLoadSurfaceFromSurface != nullptr)
+			// Explicitly call AddDirtyRect when the destination surface belongs to a texture.
+			void *pContainer = nullptr;
+			if (SUCCEEDED(pDestinationSurfaceImpl->GetContainer(IID_IDirect3DTexture9, &pContainer)) && pContainer)
 			{
-				if (SUCCEEDED(D3DXLoadSurfaceFromSurface(pDestinationSurfaceImpl->GetProxyInterface(), nullptr, &DestinationRect, pSourceSurfaceImpl->GetProxyInterface(), nullptr, &SourceRect, D3DX_FILTER_NONE, 0)))
-				{
-					// Explicitly call AddDirtyRect on the surface
-					void *pContainer = nullptr;
-					if (SUCCEEDED(pDestinationSurfaceImpl->GetContainer(IID_IDirect3DTexture9, &pContainer)) && pContainer)
-					{
-						IDirect3DTexture9 *pTexture = (IDirect3DTexture9*)pContainer;
-						pTexture->AddDirtyRect(&DestinationRect);
-						pTexture->Release();
-					}
-					hr = D3D_OK;
-				}
+				IDirect3DTexture9 *pTexture = static_cast<IDirect3DTexture9 *>(pContainer);
+				pTexture->AddDirtyRect(&DestinationRect);
+				pTexture->Release();
+			}
+		};
+
+		auto TryD3DXLoadToDestination = [&]() -> HRESULT
+		{
+			if (D3DXLoadSurfaceFromSurface == nullptr)
+				return D3DERR_INVALIDCALL;
+
+			const HRESULT result = D3DXLoadSurfaceFromSurface(
+				pDestinationSurfaceImpl->GetProxyInterface(),
+				nullptr,
+				&DestinationRect,
+				pSourceSurfaceImpl->GetProxyInterface(),
+				nullptr,
+				&SourceRect,
+				D3DX_FILTER_NONE,
+				0);
+
+			if (SUCCEEDED(result))
+				MarkDestinationTextureDirty();
+
+			return result;
+		};
+
+		auto TryD3DXLoadThroughDefaultSurface = [&]() -> HRESULT
+		{
+			if (D3DXLoadSurfaceFromSurface == nullptr || DestinationDesc.Pool != D3DPOOL_DEFAULT)
+				return D3DERR_INVALIDCALL;
+
+			IDirect3DSurface9 *TempSurface = nullptr;
+
+			HRESULT result = ProxyInterface->CreateOffscreenPlainSurface(
+				copyWidth,
+				copyHeight,
+				DestinationDesc.Format,
+				D3DPOOL_DEFAULT,
+				&TempSurface,
+				nullptr);
+
+			if (FAILED(result))
+				return result;
+
+			RECT TempRect = {};
+			TempRect.left = 0;
+			TempRect.top = 0;
+			TempRect.right = copyWidth;
+			TempRect.bottom = copyHeight;
+
+			result = D3DXLoadSurfaceFromSurface(
+				TempSurface,
+				nullptr,
+				&TempRect,
+				pSourceSurfaceImpl->GetProxyInterface(),
+				nullptr,
+				&SourceRect,
+				D3DX_FILTER_NONE,
+				0);
+
+			if (SUCCEEDED(result))
+			{
+				result = ProxyInterface->StretchRect(
+					TempSurface,
+					&TempRect,
+					pDestinationSurfaceImpl->GetProxyInterface(),
+					&DestinationRect,
+					D3DTEXF_NONE);
+			}
+
+			TempSurface->Release();
+
+			if (SUCCEEDED(result))
+				MarkDestinationTextureDirty();
+
+			return result;
+		};
+
+		auto TrySystemMemUpdateThroughDefaultSurface = [&]() -> HRESULT
+		{
+			if (SourceDesc.Pool != D3DPOOL_SYSTEMMEM || DestinationDesc.Pool != D3DPOOL_DEFAULT)
+				return D3DERR_INVALIDCALL;
+
+			IDirect3DSurface9 *TempSurface = nullptr;
+
+			HRESULT result = ProxyInterface->CreateOffscreenPlainSurface(
+				copyWidth,
+				copyHeight,
+				SourceDesc.Format,
+				D3DPOOL_DEFAULT,
+				&TempSurface,
+				nullptr);
+
+			if (FAILED(result))
+				return result;
+
+			RECT TempRect = {};
+			TempRect.left = 0;
+			TempRect.top = 0;
+			TempRect.right = copyWidth;
+			TempRect.bottom = copyHeight;
+
+			const POINT TempPoint = { 0, 0 };
+
+			result = ProxyInterface->UpdateSurface(
+				pSourceSurfaceImpl->GetProxyInterface(),
+				&SourceRect,
+				TempSurface,
+				&TempPoint);
+
+			if (SUCCEEDED(result))
+			{
+				result = ProxyInterface->StretchRect(
+					TempSurface,
+					&TempRect,
+					pDestinationSurfaceImpl->GetProxyInterface(),
+					&DestinationRect,
+					D3DTEXF_NONE);
+			}
+
+			TempSurface->Release();
+
+			if (SUCCEEDED(result))
+				MarkDestinationTextureDirty();
+
+			return result;
+		};
+
+		hr = D3DERR_INVALIDCALL;
+
+		// BF1942 compatibility:
+		// Do not immediately fail on format mismatch. The loading screen may use CreateImageSurface
+		// surfaces that end up in SCRATCH, or may copy an RGB image into a different backbuffer format.
+		if (!SameFormat ||
+			SourceDesc.Pool == D3DPOOL_SCRATCH ||
+			SourceDesc.Pool == D3DPOOL_MANAGED ||
+			DestinationDesc.Pool != D3DPOOL_DEFAULT)
+		{
+			hr = TryD3DXLoadToDestination();
+
+			if (FAILED(hr))
+				hr = TryD3DXLoadThroughDefaultSurface();
+		}
+
+		// DEFAULT -> DEFAULT can use the native D3D9 StretchRect path.
+		if (FAILED(hr) && SameFormat && SourceDesc.Pool == D3DPOOL_DEFAULT && DestinationDesc.Pool == D3DPOOL_DEFAULT)
+		{
+			hr = ProxyInterface->StretchRect(
+				pSourceSurfaceImpl->GetProxyInterface(),
+				&SourceRect,
+				pDestinationSurfaceImpl->GetProxyInterface(),
+				&DestinationRect,
+				D3DTEXF_NONE);
+
+			if (SUCCEEDED(hr))
+				MarkDestinationTextureDirty();
+		}
+
+		// SYSTEMMEM -> DEFAULT is the common image-surface path. First try a DEFAULT intermediate surface,
+		// then fall back to the original UpdateSurface behavior for cases where the driver accepts it.
+		if (FAILED(hr) && SameFormat && SourceDesc.Pool == D3DPOOL_SYSTEMMEM && DestinationDesc.Pool == D3DPOOL_DEFAULT)
+		{
+			hr = TrySystemMemUpdateThroughDefaultSurface();
+
+			if (FAILED(hr))
+			{
+				const POINT fallbackPt = { DestinationRect.left, DestinationRect.top };
+
+				hr = ProxyInterface->UpdateSurface(
+					pSourceSurfaceImpl->GetProxyInterface(),
+					&SourceRect,
+					pDestinationSurfaceImpl->GetProxyInterface(),
+					&fallbackPt);
+
+				if (SUCCEEDED(hr))
+					MarkDestinationTextureDirty();
 			}
 		}
-		else if (SourceDesc.Pool == D3DPOOL_DEFAULT)
+
+		// Last-chance fallback: try D3DX again. This catches unusual pool/format combinations without
+		// changing the fast path for normal same-format DEFAULT/SYSTEMMEM copies.
+		if (FAILED(hr))
 		{
-			hr = ProxyInterface->StretchRect(pSourceSurfaceImpl->GetProxyInterface(), &SourceRect, pDestinationSurfaceImpl->GetProxyInterface(), &DestinationRect, D3DTEXF_NONE);
+			hr = TryD3DXLoadToDestination();
+
+			if (FAILED(hr))
+				hr = TryD3DXLoadThroughDefaultSurface();
 		}
-else if (SourceDesc.Pool == D3DPOOL_SYSTEMMEM)
-{
-    const POINT pt = { 0, 0 };
 
-    IDirect3DSurface9 *TempSurface = nullptr;
-
-    const UINT copyWidth  = SourceRect.right - SourceRect.left;
-    const UINT copyHeight = SourceRect.bottom - SourceRect.top;
-
-    hr = ProxyInterface->CreateOffscreenPlainSurface(
-        copyWidth,
-        copyHeight,
-        SourceDesc.Format,
-        D3DPOOL_DEFAULT,
-        &TempSurface,
-        nullptr
-    );
-
-    if (SUCCEEDED(hr))
-    {
-        RECT tempRect = {};
-        tempRect.left = 0;
-        tempRect.top = 0;
-        tempRect.right = copyWidth;
-        tempRect.bottom = copyHeight;
-
-        hr = ProxyInterface->UpdateSurface(
-            pSourceSurfaceImpl->GetProxyInterface(),
-            &SourceRect,
-            TempSurface,
-            &pt
-        );
-
-        if (SUCCEEDED(hr))
-        {
-            hr = ProxyInterface->StretchRect(
-                TempSurface,
-                &tempRect,
-                pDestinationSurfaceImpl->GetProxyInterface(),
-                &DestinationRect,
-                D3DTEXF_NONE
-            );
-        }
-
-        TempSurface->Release();
-    }
-
-    // フォールバック：上の方法が失敗した場合は従来処理も試す
-    if (FAILED(hr))
-    {
-        const POINT fallbackPt = { DestinationRect.left, DestinationRect.top };
-        hr = ProxyInterface->UpdateSurface(
-            pSourceSurfaceImpl->GetProxyInterface(),
-            &SourceRect,
-            pDestinationSurfaceImpl->GetProxyInterface(),
-            &fallbackPt
-        );
-    }
-}
-		
 		if (FAILED(hr))
 		{
 #ifndef D3D8TO9NOLOG
-			LOG << "Failed to translate 'IDirect3DDevice8::CopyRects' call from '[" << SourceDesc.Width << "x" << SourceDesc.Height << ", " << SourceDesc.Format << ", " << SourceDesc.MultiSampleType << ", " << SourceDesc.Usage << ", " << SourceDesc.Pool << "]' to '[" << DestinationDesc.Width << "x" << DestinationDesc.Height << ", " << DestinationDesc.Format << ", " << DestinationDesc.MultiSampleType << ", " << DestinationDesc.Usage << ", " << DestinationDesc.Pool << "]'!" << std::endl;
+			LOG << "Failed to translate 'IDirect3DDevice8::CopyRects' call from '["
+				<< SourceDesc.Width << "x" << SourceDesc.Height << ", " << SourceDesc.Format
+				<< ", " << SourceDesc.MultiSampleType << ", " << SourceDesc.Usage << ", " << SourceDesc.Pool
+				<< "]' to '["
+				<< DestinationDesc.Width << "x" << DestinationDesc.Height << ", " << DestinationDesc.Format
+				<< ", " << DestinationDesc.MultiSampleType << ", " << DestinationDesc.Usage << ", " << DestinationDesc.Pool
+				<< "]' rect " << i << " src=("
+				<< SourceRect.left << "," << SourceRect.top << "," << SourceRect.right << "," << SourceRect.bottom
+				<< ") dst=("
+				<< DestinationRect.left << "," << DestinationRect.top << "," << DestinationRect.right << "," << DestinationRect.bottom
+				<< ") with error code " << std::hex << hr << std::dec << "!" << std::endl;
 #endif
 			break;
 		}
