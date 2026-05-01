@@ -222,30 +222,6 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Reset(D3DPRESENT_PARAMETERS8 *pPresen
 
 	const HRESULT hr = ProxyInterface->Reset(&PresentParams);
 
-#ifndef D3D8TO9NOLOG
-	if (FAILED(hr))
-	{
-		LOG << "BF1942 compat: Reset failed. Error code " << std::hex << hr << std::dec
-			<< ", BackBuffer=" << PresentParams.BackBufferWidth << "x" << PresentParams.BackBufferHeight
-			<< ", Format=" << PresentParams.BackBufferFormat
-			<< ", Count=" << PresentParams.BackBufferCount
-			<< ", MultiSampleType=" << PresentParams.MultiSampleType
-			<< ", SwapEffect=" << PresentParams.SwapEffect
-			<< ", Windowed=" << PresentParams.Windowed
-			<< ", hDeviceWindow=" << PresentParams.hDeviceWindow
-			<< ", EnableAutoDepthStencil=" << PresentParams.EnableAutoDepthStencil
-			<< ", AutoDepthStencilFormat=" << PresentParams.AutoDepthStencilFormat
-			<< ", Flags=" << PresentParams.Flags
-			<< ", FullScreen_RefreshRateInHz=" << PresentParams.FullScreen_RefreshRateInHz
-			<< ", PresentationInterval=" << PresentParams.PresentationInterval
-			<< std::endl;
-	}
-	else
-	{
-		LOG << "BF1942 compat: Reset succeeded." << std::endl;
-	}
-#endif
-
 	g_BF1942SceneActive = false;
 
 	if (SUCCEEDED(hr))
@@ -264,72 +240,32 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Reset(D3DPRESENT_PARAMETERS8 *pPresen
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, const RECT *pDestRect, HWND hDestWindowOverride, const RGNDATA *pDirtyRegion)
 {
 	// BF1942 compatibility:
-	// D3D9 returns D3DERR_INVALIDCALL if Present is called in some invalid states
-	// that older D3D8 titles could accidentally rely on. Force full-frame Present,
-	// and if a scene is active, end it before presenting.
-#ifndef D3D8TO9NOLOG
-	if (pSourceRect != nullptr || pDestRect != nullptr || pDirtyRegion != nullptr)
-	{
-		LOG << "BF1942 compat: Present forcing full-frame Present. "
-			<< "sourceRect=" << pSourceRect
-			<< ", destRect=" << pDestRect
-			<< ", dirtyRegion=" << pDirtyRegion
-			<< ", hwnd=" << hDestWindowOverride
-			<< std::endl;
-	}
-#endif
-
+	// BF1942 can call Present while a scene is still active during loading screens.
+	// D3D8 tolerated this more loosely, while D3D9 rejects it with D3DERR_INVALIDCALL.
+	// End the active scene before Present, then ignore source/destination rectangles.
 	UNREFERENCED_PARAMETER(pSourceRect);
 	UNREFERENCED_PARAMETER(pDestRect);
 	UNREFERENCED_PARAMETER(pDirtyRegion);
 
 	if (g_BF1942SceneActive)
 	{
-#ifndef D3D8TO9NOLOG
-		LOG << "BF1942 compat: Present was called while a scene was active. "
-			<< "Calling EndScene before Present." << std::endl;
-#endif
-		HRESULT endHr = ProxyInterface->EndScene();
-#ifndef D3D8TO9NOLOG
-		if (FAILED(endHr))
-		{
-			LOG << "BF1942 compat: EndScene-before-Present failed. Error code "
-				<< std::hex << endHr << std::dec << "!" << std::endl;
-		}
-#endif
+		ProxyInterface->EndScene();
 		g_BF1942SceneActive = false;
 	}
 
-	HRESULT coop = ProxyInterface->TestCooperativeLevel();
-#ifndef D3D8TO9NOLOG
-	if (FAILED(coop))
-	{
-		LOG << "BF1942 compat: TestCooperativeLevel before Present returned "
-			<< std::hex << coop << std::dec << "." << std::endl;
-	}
-#endif
-
 	HRESULT hr = ProxyInterface->Present(nullptr, nullptr, hDestWindowOverride, nullptr);
 
-	// Some older games pass a window override that D3D9 does not accept after Reset.
-	// Try again with a null window override before giving up.
+	// Some setups reject the window override after Reset. Retry without it.
 	if (FAILED(hr) && hDestWindowOverride != nullptr)
 	{
-#ifndef D3D8TO9NOLOG
-		LOG << "BF1942 compat: full-frame Present failed with hwnd override. "
-			<< "Retrying with nullptr hwnd. Error code " << std::hex << hr << std::dec << "!" << std::endl;
-#endif
 		hr = ProxyInterface->Present(nullptr, nullptr, nullptr, nullptr);
 	}
 
 #ifndef D3D8TO9NOLOG
 	if (FAILED(hr))
 	{
-		LOG << "BF1942 compat: full-frame Present failed. Error code "
-			<< std::hex << hr << std::dec
-			<< ", TestCooperativeLevel=" << std::hex << coop << std::dec
-			<< ", sceneActive=" << g_BF1942SceneActive
-			<< "!" << std::endl;
+		LOG << "BF1942 compat: Present failed. Error code "
+			<< std::hex << hr << std::dec << "!" << std::endl;
 	}
 #endif
 
@@ -792,9 +728,6 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::BeginScene()
 {
 	if (g_BF1942SceneActive)
 	{
-#ifndef D3D8TO9NOLOG
-		LOG << "BF1942 compat: BeginScene called while already active. Returning D3D_OK." << std::endl;
-#endif
 		return D3D_OK;
 	}
 
@@ -804,10 +737,12 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::BeginScene()
 	{
 		g_BF1942SceneActive = true;
 	}
+
 #ifndef D3D8TO9NOLOG
-	else
+	if (FAILED(hr))
 	{
-		LOG << "BF1942 compat: BeginScene failed. Error code " << std::hex << hr << std::dec << "!" << std::endl;
+		LOG << "BF1942 compat: BeginScene failed. Error code "
+			<< std::hex << hr << std::dec << "!" << std::endl;
 	}
 #endif
 
@@ -817,9 +752,6 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::EndScene()
 {
 	if (!g_BF1942SceneActive)
 	{
-#ifndef D3D8TO9NOLOG
-		LOG << "BF1942 compat: EndScene called while no scene is active. Returning D3D_OK." << std::endl;
-#endif
 		return D3D_OK;
 	}
 
@@ -829,10 +761,12 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::EndScene()
 	{
 		g_BF1942SceneActive = false;
 	}
+
 #ifndef D3D8TO9NOLOG
-	else
+	if (FAILED(hr))
 	{
-		LOG << "BF1942 compat: EndScene failed. Error code " << std::hex << hr << std::dec << "!" << std::endl;
+		LOG << "BF1942 compat: EndScene failed. Error code "
+			<< std::hex << hr << std::dec << "!" << std::endl;
 	}
 #endif
 
