@@ -518,13 +518,66 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::CopyRects(IDirect3DSurface8 *pSourceS
 		{
 			hr = ProxyInterface->StretchRect(pSourceSurfaceImpl->GetProxyInterface(), &SourceRect, pDestinationSurfaceImpl->GetProxyInterface(), &DestinationRect, D3DTEXF_NONE);
 		}
-		else if (SourceDesc.Pool == D3DPOOL_SYSTEMMEM)
-		{
-			const POINT pt = { DestinationRect.left, DestinationRect.top };
+else if (SourceDesc.Pool == D3DPOOL_SYSTEMMEM)
+{
+    const POINT pt = { 0, 0 };
 
-			hr = ProxyInterface->UpdateSurface(pSourceSurfaceImpl->GetProxyInterface(), &SourceRect, pDestinationSurfaceImpl->GetProxyInterface(), &pt);
-		}
+    IDirect3DSurface9 *TempSurface = nullptr;
 
+    const UINT copyWidth  = SourceRect.right - SourceRect.left;
+    const UINT copyHeight = SourceRect.bottom - SourceRect.top;
+
+    hr = ProxyInterface->CreateOffscreenPlainSurface(
+        copyWidth,
+        copyHeight,
+        SourceDesc.Format,
+        D3DPOOL_DEFAULT,
+        &TempSurface,
+        nullptr
+    );
+
+    if (SUCCEEDED(hr))
+    {
+        RECT tempRect = {};
+        tempRect.left = 0;
+        tempRect.top = 0;
+        tempRect.right = copyWidth;
+        tempRect.bottom = copyHeight;
+
+        hr = ProxyInterface->UpdateSurface(
+            pSourceSurfaceImpl->GetProxyInterface(),
+            &SourceRect,
+            TempSurface,
+            &pt
+        );
+
+        if (SUCCEEDED(hr))
+        {
+            hr = ProxyInterface->StretchRect(
+                TempSurface,
+                &tempRect,
+                pDestinationSurfaceImpl->GetProxyInterface(),
+                &DestinationRect,
+                D3DTEXF_NONE
+            );
+        }
+
+        TempSurface->Release();
+    }
+
+    // フォールバック：上の方法が失敗した場合は従来処理も試す
+    if (FAILED(hr))
+    {
+        const POINT fallbackPt = { DestinationRect.left, DestinationRect.top };
+        hr = ProxyInterface->UpdateSurface(
+            pSourceSurfaceImpl->GetProxyInterface(),
+            &SourceRect,
+            pDestinationSurfaceImpl->GetProxyInterface(),
+            &fallbackPt
+        );
+    }
+}
+		
 		if (FAILED(hr))
 		{
 #ifndef D3D8TO9NOLOG
