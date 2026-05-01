@@ -8,6 +8,13 @@
 #include <regex>
 #include <assert.h>
 
+// BF1942 compatibility diagnostics/workarounds.
+// D3D9 is stricter than D3D8 about Present/Reset/BeginScene ordering.
+// Some old D3D8 games can end up calling Present while a scene is active
+// or continue after a failed Reset, which results in D3DERR_INVALIDCALL.
+static bool g_BF1942SceneActive = false;
+
+
 struct VertexShaderInfo
 {
 	IDirect3DVertexShader9 *Shader = nullptr;
@@ -215,6 +222,32 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Reset(D3DPRESENT_PARAMETERS8 *pPresen
 
 	const HRESULT hr = ProxyInterface->Reset(&PresentParams);
 
+#ifndef D3D8TO9NOLOG
+	if (FAILED(hr))
+	{
+		LOG << "BF1942 compat: Reset failed. Error code " << std::hex << hr << std::dec
+			<< ", BackBuffer=" << PresentParams.BackBufferWidth << "x" << PresentParams.BackBufferHeight
+			<< ", Format=" << PresentParams.BackBufferFormat
+			<< ", Count=" << PresentParams.BackBufferCount
+			<< ", MultiSampleType=" << PresentParams.MultiSampleType
+			<< ", SwapEffect=" << PresentParams.SwapEffect
+			<< ", Windowed=" << PresentParams.Windowed
+			<< ", hDeviceWindow=" << PresentParams.hDeviceWindow
+			<< ", EnableAutoDepthStencil=" << PresentParams.EnableAutoDepthStencil
+			<< ", AutoDepthStencilFormat=" << PresentParams.AutoDepthStencilFormat
+			<< ", Flags=" << PresentParams.Flags
+			<< ", FullScreen_RefreshRateInHz=" << PresentParams.FullScreen_RefreshRateInHz
+			<< ", PresentationInterval=" << PresentParams.PresentationInterval
+			<< std::endl;
+	}
+	else
+	{
+		LOG << "BF1942 compat: Reset succeeded." << std::endl;
+	}
+#endif
+
+	g_BF1942SceneActive = false;
+
 	if (SUCCEEDED(hr))
 	{
 		// The default value of D3DRS_POINTSIZE_MIN is 0.0f in D3D8,
@@ -231,8 +264,9 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Reset(D3DPRESENT_PARAMETERS8 *pPresen
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, const RECT *pDestRect, HWND hDestWindowOverride, const RGNDATA *pDirtyRegion)
 {
 	// BF1942 compatibility:
-	// The game can pass source/destination rectangles during loading screens that D3D9 rejects
-	// with D3DERR_INVALIDCALL (0x8876086C). Prefer a full-frame Present for compatibility.
+	// D3D9 returns D3DERR_INVALIDCALL if Present is called in some invalid states
+	// that older D3D8 titles could accidentally rely on. Force full-frame Present,
+	// and if a scene is active, end it before presenting.
 #ifndef D3D8TO9NOLOG
 	if (pSourceRect != nullptr || pDestRect != nullptr || pDirtyRegion != nullptr)
 	{
@@ -248,6 +282,32 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, cons
 	UNREFERENCED_PARAMETER(pSourceRect);
 	UNREFERENCED_PARAMETER(pDestRect);
 	UNREFERENCED_PARAMETER(pDirtyRegion);
+
+	if (g_BF1942SceneActive)
+	{
+#ifndef D3D8TO9NOLOG
+		LOG << "BF1942 compat: Present was called while a scene was active. "
+			<< "Calling EndScene before Present." << std::endl;
+#endif
+		HRESULT endHr = ProxyInterface->EndScene();
+#ifndef D3D8TO9NOLOG
+		if (FAILED(endHr))
+		{
+			LOG << "BF1942 compat: EndScene-before-Present failed. Error code "
+				<< std::hex << endHr << std::dec << "!" << std::endl;
+		}
+#endif
+		g_BF1942SceneActive = false;
+	}
+
+	HRESULT coop = ProxyInterface->TestCooperativeLevel();
+#ifndef D3D8TO9NOLOG
+	if (FAILED(coop))
+	{
+		LOG << "BF1942 compat: TestCooperativeLevel before Present returned "
+			<< std::hex << coop << std::dec << "." << std::endl;
+	}
+#endif
 
 	HRESULT hr = ProxyInterface->Present(nullptr, nullptr, hDestWindowOverride, nullptr);
 
@@ -266,7 +326,10 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::Present(const RECT *pSourceRect, cons
 	if (FAILED(hr))
 	{
 		LOG << "BF1942 compat: full-frame Present failed. Error code "
-			<< std::hex << hr << std::dec << "!" << std::endl;
+			<< std::hex << hr << std::dec
+			<< ", TestCooperativeLevel=" << std::hex << coop << std::dec
+			<< ", sceneActive=" << g_BF1942SceneActive
+			<< "!" << std::endl;
 	}
 #endif
 
@@ -727,11 +790,53 @@ HRESULT STDMETHODCALLTYPE Direct3DDevice8::GetDepthStencilSurface(IDirect3DSurfa
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::BeginScene()
 {
-	return ProxyInterface->BeginScene();
+	if (g_BF1942SceneActive)
+	{
+#ifndef D3D8TO9NOLOG
+		LOG << "BF1942 compat: BeginScene called while already active. Returning D3D_OK." << std::endl;
+#endif
+		return D3D_OK;
+	}
+
+	HRESULT hr = ProxyInterface->BeginScene();
+
+	if (SUCCEEDED(hr))
+	{
+		g_BF1942SceneActive = true;
+	}
+#ifndef D3D8TO9NOLOG
+	else
+	{
+		LOG << "BF1942 compat: BeginScene failed. Error code " << std::hex << hr << std::dec << "!" << std::endl;
+	}
+#endif
+
+	return hr;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::EndScene()
 {
-	return ProxyInterface->EndScene();
+	if (!g_BF1942SceneActive)
+	{
+#ifndef D3D8TO9NOLOG
+		LOG << "BF1942 compat: EndScene called while no scene is active. Returning D3D_OK." << std::endl;
+#endif
+		return D3D_OK;
+	}
+
+	HRESULT hr = ProxyInterface->EndScene();
+
+	if (SUCCEEDED(hr))
+	{
+		g_BF1942SceneActive = false;
+	}
+#ifndef D3D8TO9NOLOG
+	else
+	{
+		LOG << "BF1942 compat: EndScene failed. Error code " << std::hex << hr << std::dec << "!" << std::endl;
+	}
+#endif
+
+	return hr;
 }
 HRESULT STDMETHODCALLTYPE Direct3DDevice8::Clear(DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil)
 {
